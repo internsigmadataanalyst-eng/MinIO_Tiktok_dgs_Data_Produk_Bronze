@@ -1,1 +1,4 @@
 .env
+TESTING.md
+run_daily_etl_original.py
+run_daily_etl_original.cpython-314.pyc

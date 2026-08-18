@@ -6,42 +6,10 @@ from datetime import datetime, timezone
 import pandas as pd
 
 from src.data_produk.utils.transform_utils import (
-    clean_numeric_columns,
     parse_mixed_dates,
     to_snake_case,
 )
 from src.data_produk.utils.minio_client import filter_by_sheet_watermark
-
-
-NUMERIC_COLS = [
-    "GMV",
-    "Produk terjual",
-    "Pesanan",
-    "GMV dari Shop Tab",
-    "Produk terjual dari Tab Shop",
-    "Impresi daftar produk shop tab",
-    "Tayangan halaman shop tab",
-    "Tayangan halaman unik shop tab",
-    "Pembeli produk unik shop tab",
-    "GMV dari LIVE",
-    "Produk terjual dari LIVE",
-    "Impresi dari LIVE",
-    "Tayangan halaman dari LIVE",
-    "Tayangan halaman unik dari LIVE",
-    "Pembeli produk unik dari LIVE",
-    "GMV dari video",
-    "Produk terjual dari video",
-    "Impresi dari video",
-    "Tayangan halaman dari video",
-    "Tayangan halaman unik dari video",
-    "Pembeli produk unik dari video",
-    "GMV dari kartu produk",
-    "Produk terjual dari kartu produk",
-    "Impresi dari kartu produk",
-    "Tayangan halaman dari kartu produk",
-    "Tayangan halaman unik dari kartu produk",
-    "Pembeli unik dari kartu produk",
-]
 
 
 def _canon(x):
@@ -60,18 +28,23 @@ def build_bronze_produk(
     Filter incremental per sheet_name berdasarkan watermark (sheet_watermarks).
     Output: (df siap di-load ke BRONZE_DB.bronze_live, sheet_max_dates)
     """
-    # numeric cleaning
-    tiktok_produk_clean1 = clean_numeric_columns(
-        tiktok_produk_raw, NUMERIC_COLS, fillna_value=0
-    )
-
+    # NOTE: numeric cleaning & date parsing dipindahkan ke
+    # validate_and_normalize_raw() di utils/transform_utils.py, dipanggil
+    # tepat setelah fetch (STEP 2). Baris di bawah DI-NONAKTIFKAN karena
+    # clean_numeric_columns tidak idempoten (double-clean merusak desimal).
+    #
+    # tiktok_produk_clean1 = clean_numeric_columns(
+    #     tiktok_produk_raw, NUMERIC_COLS, fillna_value=0
+    # )
+    #
+    # copy 
+    df = tiktok_produk_raw.copy()
     # parse tanggal
-    tiktok_produk_clean1["Tanggal"] = parse_mixed_dates(
-        tiktok_produk_clean1["Tanggal"], return_date=False
+    df["Tanggal"] = parse_mixed_dates(
+        df["Tanggal"], return_date=False
     )
 
-    # copy & snake_case
-    df = tiktok_produk_clean1.copy()
+    # snake_case
     df.columns = df.columns.map(to_snake_case)
 
     # buang baris tanpa id
