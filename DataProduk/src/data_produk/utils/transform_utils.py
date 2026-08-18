@@ -4,6 +4,8 @@ import re
 import numpy as np
 import pandas as pd
 
+from typing import Any, Dict, List, Union
+
 EXCEL_EPOCH = pd.Timestamp("1899-12-30")
 
 NUMERIC_COLS = [
