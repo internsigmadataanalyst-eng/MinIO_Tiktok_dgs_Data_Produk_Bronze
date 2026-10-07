@@ -1,10 +1,12 @@
 # src/data_produk/utils/transform_utils.py
 import re
+import warnings
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
-from typing import Any, Dict, List, Union
+from typing import Any, List
 
 EXCEL_EPOCH = pd.Timestamp("1899-12-30")
 
@@ -36,6 +38,12 @@ NUMERIC_COLS = [
     "Tayangan halaman dari kartu produk",
     "Tayangan halaman unik dari kartu produk",
     "Pembeli unik dari kartu produk",
+    "GMV dari affiliasi",
+    "Produk terjual dari affiliasi",
+    "Impresi dari affiliasi",
+    "Tayangan halaman dari affiliasi",
+    "Tayangan halaman unik dari affiliasi",
+    "Pembeli unik dari affiliasi",
 ]
 
 PERCENT_COLS = [
@@ -45,9 +53,41 @@ PERCENT_COLS = [
     "Persentase konversi dari LIVE",
     "Rasio klik-tayang dari video",
     "Persentase konversi dari video",
+    "Rasio klik-tayang dari affiliasi",
+    "Persentase konversi dari affiliasi",
     "Rasio klik-tayang dari kartu produk",
     "Persentase konversi dari kartu produk",
 ]
+
+# Non-metric columns the source must provide. Used by the ingest-time header
+# check: a sheet missing one of these would otherwise reach bronze as a silent
+# NULL column (to_gbq keeps columns the source dropped, with no error anywhere).
+DIM_COLS = ["Tanggal", "Toko", "Produk", "ID", "Status", "Rentang GMV"]
+
+# Source sheets disagree on the product-status vocabulary: the current export
+# writes Indonesian (Aktif/Nonaktif), the legacy export English
+# (Active/Inactive). Silver stores one column, so normalize to English here.
+STATUS_VALUE_MAP = {
+    "AKTIF": "ACTIVE",
+    "NONAKTIF": "INACTIVE",
+    "ACTIVE": "ACTIVE",
+    "INACTIVE": "INACTIVE",
+}
+
+
+def normalize_status(series: pd.Series) -> tuple[pd.Series, int]:
+    """Map status to English, uppercased and trimmed.
+
+    Returns (normalized, n_unmapped). Values absent from STATUS_VALUE_MAP are
+    KEPT uppercased rather than blanked, so a future status TikTok introduces
+    (Takedown, Draft, ...) stays visible instead of being destroyed; the count
+    lets the caller surface it as a warning.
+    """
+    upper = series.astype("string").fillna("").str.strip().str.upper()
+    mapped = upper.map(STATUS_VALUE_MAP)
+    n_unmapped = int((mapped.isna() & (upper != "")).sum())
+    return mapped.where(mapped.notna(), upper), n_unmapped
+
 
 # A valid numeric cell may only contain digits / '.' / ',' / 'Rp' / whitespace /
 # '#' / '-' (both are censored markers: '######' or '-' mean the value is
@@ -88,7 +128,18 @@ def _coerce_numeric_series(series: pd.Series) -> tuple[pd.Series, pd.Series]:
     return pd.to_numeric(s, errors="coerce"), s
 
 
-def clean_numeric_columns(df: pd.DataFrame, cols, fillna_value=0) -> pd.DataFrame:
+def clean_numeric_columns(df: pd.DataFrame, cols) -> pd.DataFrame:
+    """Coerce the given columns to integers, preserving missing values.
+
+    A cell the source left BLANK stays missing (NULL downstream); a cell where
+    the source wrote a literal 0 stays 0. The sheets emit explicit zeros for
+    genuinely-zero metrics, so blank always means "not reported" (e.g. the
+    legacy block where affiliasi was never tracked) -- filling it with 0 would
+    assert zero traffic.
+
+    Columns without missing values, or containing any fractional part, fall
+    back to float64 (matching the previous behaviour).
+    """
     df = df.copy()
 
     for col in cols:
@@ -97,10 +148,15 @@ def clean_numeric_columns(df: pd.DataFrame, cols, fillna_value=0) -> pd.DataFram
             continue
 
         values, _ = _coerce_numeric_series(df[col])
-        df[col] = values.fillna(fillna_value)
 
-        if (df[col] % 1 == 0).all():
-            df[col] = df[col].astype(int)
+        # Int64 (nullable) keeps the BigQuery type INTEGER; astype("Int64")
+        # raises on a fractional value, so gate on the integral part first.
+        # dropna() is required: NaN % 1 is NaN, never 0, so a plain check
+        # would silently skip the cast on any column with blanks.
+        if (values.dropna() % 1 == 0).all():
+            df[col] = values.astype("Int64")
+        else:
+            df[col] = values
 
     return df
 
@@ -223,6 +279,7 @@ def validate_and_normalize_raw(
     - Detects mixed/corrupted cells in numeric columns (main filter) and, when
       given, in percentage/rate columns (percent_cols).
     - Parses mixed dates; rows with NaT are captured as date-error rows.
+    - Blank `Toko` rows are quarantined (toko_blank) — watermark grain is (creds,toko).
     - Splits into (df_valid, df_error, report). df_error keeps the ORIGINAL raw
       values plus an error_reason column; df_valid is cleaned for downstream.
     """
@@ -233,13 +290,32 @@ def validate_and_normalize_raw(
     corruption = detect_numeric_corruption(
         df, numeric_cols, percent_cols=percent_cols, date_col=date_col
     )
-    df_clean = clean_numeric_columns(df, numeric_cols, fillna_value=0)
+    df_clean = clean_numeric_columns(df, numeric_cols)
 
     parsed = parse_mixed_dates(df_clean[date_col], return_date=False)
     df_clean[date_col] = parsed
     date_error = parsed.isna()
 
-    error_mask = (corruption["affected_mask"] | date_error) & ~blank_mask
+    date_error = parsed.isna()
+
+    # Future-date gate (soft quarantine): a validly-parsed date strictly after
+    # today is a wrong input. It is routed to df_error so it never reaches the
+    # watermark filter (thus cannot advance the watermark / poison ingestion).
+    today_ts = pd.Timestamp(datetime.now().date())
+    date_future = parsed.notna() & (parsed > today_ts)
+
+    # Blank toko detection — verbatim, no normalization; blank = "", "-", "nan", "none", "nat"
+    toko_col = "Toko" if "Toko" in df.columns else ("toko" if "toko" in df.columns else None)
+    if toko_col is not None:
+        raw_toko = df[toko_col].astype(str).str.strip()
+        # pd.isna already stringified to "nan", but keep explicit
+        toko_blank = raw_toko.str.lower().isin(["", "-", "nan", "none", "nat"])
+        # also catch truly empty after strip (already covered) and handle NaN from original
+        toko_blank = toko_blank | df[toko_col].isna()
+    else:
+        toko_blank = pd.Series(False, index=df.index)
+
+    error_mask = (corruption["affected_mask"] | date_error | toko_blank | date_future) & ~blank_mask
 
     df_error = df[error_mask].copy()
     reasons = []
@@ -249,6 +325,10 @@ def validate_and_normalize_raw(
             reason_parts.append("numeric_mixed")
         if date_error.loc[idx]:
             reason_parts.append("date_unparsable")
+        if date_future.loc[idx]:
+            reason_parts.append("date_future")
+        if toko_blank.loc[idx]:
+            reason_parts.append("toko_blank")
         reasons.append("|".join(reason_parts))
     df_error["error_reason"] = reasons
 
@@ -262,7 +342,9 @@ def validate_and_normalize_raw(
         "affected_dates": corruption["affected_dates"],
         "n_bad_rows": int(error_mask.sum()),
         "n_date_errors": int(date_error.sum()),
+        "n_date_future": int(date_future.sum()),
         "n_blank_rows": int(blank_mask.sum()),
+        "n_toko_blank": int(toko_blank.sum()),
     }
 
     return df_valid, df_error, report
@@ -283,14 +365,23 @@ def parse_mixed_dates(series: pd.Series, return_date=True) -> pd.Series:
     mask_dmy2 = s_norm.str.match(r"^\s*\d{1,2}/\d{1,2}/\d{2}\s*$", na=False)
     dmy2 = pd.to_datetime(s_norm.where(mask_dmy2), format="%d/%m/%y", errors="coerce")
 
-    iso_generic = pd.to_datetime(s, errors="coerce", format=None)
-
     mask_serial = s.str.match(r"^\d{3,6}$", na=False)
     serial_vals = pd.to_numeric(s.where(mask_serial), errors="coerce")
     serial = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
     serial.loc[mask_serial] = EXCEL_EPOCH + pd.to_timedelta(
         serial_vals.loc[mask_serial], unit="D"
     )
+
+    remaining_mask = (
+        ymd.isna() & dmy4.isna() & dmy2.isna() & serial.isna() & ~s.isna()
+    )
+    iso_generic = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    if remaining_mask.any():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            iso_generic.loc[remaining_mask] = pd.to_datetime(
+                s.loc[remaining_mask], errors="coerce", format="mixed"
+            )
 
     parsed = (
         ymd.combine_first(dmy4)

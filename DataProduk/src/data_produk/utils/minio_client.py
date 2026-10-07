@@ -2,7 +2,7 @@
 import os
 import json
 import io
-from datetime import datetime
+from datetime import datetime, date
 from minio import Minio
 from minio.error import S3Error
 import pandas as pd
@@ -28,11 +28,13 @@ def get_minio_client() -> tuple[Minio, str]:
 def get_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: str) -> tuple[dict, list]:
     """Fetches the per-sheet watermark table from MinIO.
 
+    Watermark grain is (creds, sheet_name, toko) — toko verbatim, no normalization.
     Assumes the watermark file holds the per-sheet table format
-    ({"sheets": [...]}).
+    ({"sheets": [{"creds","sheet_name","toko","last_processed_date","updated_at"}]}).
+    Flush again on grain change: old (creds,toko) file is deleted.
 
     Returns:
-        watermark_map: {creds: last_processed_date}
+        watermark_map: {(creds, sheet_name, toko): last_processed_date}
         records: raw rows as read.
     """
     try:
@@ -52,41 +54,52 @@ def get_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: str) 
     watermark_map = {}
     for rec in records:
         creds = str(rec["creds"])
+        sheet_name = str(rec.get("sheet_name") or "")
+        toko = str(rec.get("toko") or "")  # verbatim, no normalization
         date_val = str(rec["last_processed_date"]).strip()[:10]
-        watermark_map[creds] = max(watermark_map.get(creds, ""), date_val)
+        key = (creds, sheet_name, toko)
+        watermark_map[key] = max(watermark_map.get(key, ""), date_val)
 
-    print(f"[MINIO] Watermark found for {len(records)} sheet(s).")
+    print(f"[MINIO] Watermark found for {len(records)} group(s) (creds,sheet_name,toko).")
     return watermark_map, records
 
 
-def update_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: str, prev_records: list, sheet_max_dates: dict):
-    """Persists the per-sheet watermark table to MinIO.
+def update_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: str, prev_records: list, sheet_max_dates: dict, creds_sheet_map: dict | None = None):
+    """Rebuilds the watermark table preserving idle (creds,sheet_name,toko) groups.
 
-    Only sheets in sheet_max_dates get a new last_processed_date and updated_at.
-    Sheets already up-to-date keep their previous values; new sheets are appended.
+    Grain is (creds, sheet_name, toko) — toko verbatim. Idle groups are preserved.
+    sheet_name is part of the key, so creds_sheet_map is now optional (kept for
+    backward compat, ignored for triple grain). Flush again to fix old (creds,toko) file.
     """
     now = datetime.now().isoformat()
 
-    by_creds = {}
+    # Preserve idle groups keyed by (creds, sheet_name, toko)
+    by_key = {}
     for rec in prev_records:
-        creds = str(rec.get("creds") or rec.get("sheet_name") or "")
-        by_creds[creds] = {
+        creds = str(rec.get("creds") or "")
+        sheet_name = str(rec.get("sheet_name") or "")
+        toko = str(rec.get("toko") or "")
+        by_key[(creds, sheet_name, toko)] = {
             "creds": creds,
-            "sheet_name": rec.get("sheet_name") or creds,
-            "last_processed_date": rec["last_processed_date"],
-            "updated_at": rec.get("updated_at", ""),
+            "sheet_name": sheet_name or creds,
+            "toko": toko,
+            "last_processed_date": str(rec.get("last_processed_date") or "").strip()[:10],
+            "updated_at": rec.get("updated_at") or now,
         }
 
-    for creds, max_date in sheet_max_dates.items():
-        prev_sheet_name = by_creds.get(creds, {}).get("sheet_name")
-        by_creds[creds] = {
+    for (creds, sheet_name, toko), max_date in sheet_max_dates.items():
+        creds = str(creds)
+        sheet_name = str(sheet_name or "")
+        toko = str(toko or "")
+        by_key[(creds, sheet_name, toko)] = {
             "creds": creds,
-            "sheet_name": prev_sheet_name or creds,
-            "last_processed_date": max_date,
+            "sheet_name": sheet_name or creds,
+            "toko": toko,
+            "last_processed_date": str(max_date).strip()[:10],
             "updated_at": now,
         }
 
-    records = sorted(by_creds.values(), key=lambda rec: str(rec["creds"]))
+    records = sorted(by_key.values(), key=lambda rec: (str(rec["creds"]), str(rec["sheet_name"]), str(rec["toko"])))
 
     payload = json.dumps({"sheets": records}).encode("utf-8")
     minio_client.put_object(
@@ -96,7 +109,7 @@ def update_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: st
         length=len(payload),
         content_type="application/json",
     )
-    print(f"[MINIO] Updated watermark JSON for {len(records)} sheet(s).")
+    print(f"[MINIO] Updated watermark JSON for {len(records)} group(s) (creds,sheet_name,toko).")
 
 
 ERROR_MANIFEST_PATH = "error_list_watermark/error_manifest.json"
@@ -124,9 +137,9 @@ def filter_already_quarantined(minio_client: Minio, bucket: str, df_error: pd.Da
     """Dedupe gate BEFORE writing quarantine: drops already-quarantined bad rows.
 
     Compares df_error against the manifest state of the LAST run. A group
-    (sheet_name, creds, error_date) is skipped ONLY when an open manifest entry
-    exists with the same key AND the same n_rows. New tanggal, new sheet, or a
-    changed row count pass through in full and get re-quarantined.
+    (sheet_name, creds, toko, error_date) is skipped ONLY when an open manifest entry
+    exists with the same key AND the same n_rows. New tanggal, new sheet, new toko,
+    or a changed row count pass through in full and get re-quarantined.
 
     MUST be called BEFORE sync_error_manifest: that function writes this run's
     groups into the manifest, so calling it after would make every group look
@@ -149,7 +162,7 @@ def filter_already_quarantined(minio_client: Minio, bucket: str, df_error: pd.Da
 
     known = {}
     for rec in open_records:
-        key = (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("error_date")))
+        key = (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("toko") or ""), str(rec.get("error_date")))
         try:
             known[key] = int(rec.get("n_rows") or 0)
         except (TypeError, ValueError):
@@ -159,11 +172,29 @@ def filter_already_quarantined(minio_client: Minio, bucket: str, df_error: pd.Da
     df["_error_date"] = _error_date_series(df)
     sn_col = "sheet_name" if "sheet_name" in df.columns else "creds"
     cr_col = "creds" if "creds" in df.columns else sn_col
+    # toko column: prefer "Toko" raw, else "toko", else fallback to creds
+    if "Toko" in df.columns:
+        toko_col = "Toko"
+    elif "toko" in df.columns:
+        toko_col = "toko"
+    else:
+        toko_col = None
 
     keep = pd.Series(True, index=df.index)
     n_skip_groups = 0
-    for (sheet_name, creds, error_date), idx in df.groupby([sn_col, cr_col, "_error_date"]).groups.items():
-        key = (str(sheet_name), str(creds), str(error_date))
+    if toko_col is not None:
+        group_cols = [sn_col, cr_col, toko_col, "_error_date"]
+    else:
+        group_cols = [sn_col, cr_col, "_error_date"]
+
+    for keys, idx in df.groupby(group_cols, dropna=False).groups.items():
+        if toko_col is not None:
+            sheet_name, creds, toko, error_date = keys
+            toko = "" if pd.isna(toko) else str(toko)
+        else:
+            sheet_name, creds, error_date = keys
+            toko = ""
+        key = (str(sheet_name), str(creds), str(toko), str(error_date))
         n_rows = len(idx)
         if known.get(key) == n_rows:
             keep.loc[idx] = False
@@ -200,50 +231,105 @@ def write_quarantine(minio_client: Minio, bucket: str, df_error: pd.DataFrame, t
 
 
 def _confirmed_recovered_keys(df_valid: pd.DataFrame, candidates: list) -> set:
-    """Which candidate keys (sheet_name, creds, error_date) are PROVEN recovered.
+    """Which candidate keys (sheet_name, creds, toko, error_date) are PROVEN recovered.
 
     A key is only confirmed when the same number of valid rows now exist as the
     manifest's n_rows for that key. Absence from df_error alone is NOT proof of
     recovery (an error can change signature, e.g. numeric -> date), so unconfirmed
     keys are kept open instead of being falsely marked fixed.
+    Toko is stored verbatim (no normalization).
     """
     if df_valid is None or df_valid.empty or not candidates:
         return set()
 
+    # Toko column may be "Toko" (raw) or "toko" is not present in df_valid after snake? df_valid keeps original "Toko"
+    toko_series = None
+    if "Toko" in df_valid.columns:
+        toko_series = df_valid["Toko"].astype(str)
+    elif "toko" in df_valid.columns:
+        toko_series = df_valid["toko"].astype(str)
+    else:
+        toko_series = pd.Series("", index=df_valid.index, dtype=str)
+
+    # df_valid["Tanggal"] is Timestamp after validate_and_normalize_raw
+    try:
+        tanggal_str = pd.to_datetime(df_valid["Tanggal"]).dt.date.astype(str)
+    except Exception:
+        tanggal_str = df_valid["Tanggal"].astype(str)
+
     key_series = (
         df_valid["sheet_name"].astype(str)
         + "|" + df_valid["creds"].astype(str)
-        + "|" + pd.to_datetime(df_valid["Tanggal"]).dt.date.astype(str)
+        + "|" + toko_series
+        + "|" + tanggal_str
     )
     counts = key_series.value_counts()
 
     confirmed = set()
     for rec in candidates:
-        key = f'{rec["sheet_name"]}|{rec["creds"]}|{rec["error_date"]}'
+        key = f'{rec["sheet_name"]}|{rec["creds"]}|{rec.get("toko") or ""}|{rec["error_date"]}'
         n_expected = int(rec.get("n_rows") or 0)
         if n_expected > 0 and counts.get(key, 0) == n_expected:
-            confirmed.add((str(rec["sheet_name"]), str(rec["creds"]), str(rec["error_date"])))
+            confirmed.add((str(rec["sheet_name"]), str(rec["creds"]), str(rec.get("toko") or ""), str(rec["error_date"])))
     return confirmed
 
 
-def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame, report: dict, today_key: str, run_key: str, manifest_path: str = ERROR_MANIFEST_PATH, df_valid: pd.DataFrame = None):
+def _is_date_future_entry(rec: dict) -> bool:
+    """True when a manifest entry carries the 'date_future' error reason.
+
+    A future-date wrong input, once corrected, ALWAYS changes its error_date key
+    (the row moves to the corrected date), so the strict count-match recovery can
+    never resolve it. For this specific error type, "no longer present in this
+    run's errors" is reliable proof of remediation (the date was corrected or the
+    row removed). Mixed-reason groups still resolve on 'date_future' being present
+    (per requirements), since the future-date defect was remediated regardless.
+    """
+    reasons = rec.get("error_reasons") or []
+    return "date_future" in reasons
+
+
+def _is_legacy_future_date(rec: dict) -> bool:
+    """True for a one-time legacy entry created BEFORE date_future tagging.
+
+    Such entries lack the 'error_reasons' field, so we fall back to a heuristic:
+    if the stored error_date parses to a date strictly after today, it is a stale
+    future-date artifact. Only applied when the field is absent (None), so already-
+    tagged entries are never double-classified. Once written, every entry carries
+    'error_reasons', making this effectively a one-time cleanup pass.
+    """
+    reasons = rec.get("error_reasons")
+    if reasons is not None:
+        return False
+    d = rec.get("error_date")
+    try:
+        return pd.to_datetime(d).date() > date.today()
+    except Exception:
+        return False
+
+
+def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame, report: dict, today_key: str, run_key: str, manifest_path: str = ERROR_MANIFEST_PATH, df_valid: pd.DataFrame = None, dry_run: bool = False):
     """Syncs the error manifest at error_list_watermark/error_manifest.json.
 
+    Grain is (sheet_name, creds, toko, error_date) — same as watermark (creds,toko) plus error_date.
     Runs EVERY run (even with empty df_error):
       1. Reads current open entries.
       2. Builds current-run entries from df_error grouped by
-         (sheet_name, creds, error_date) — the same grain as the watermark.
+         (sheet_name, creds, toko, error_date) — the same grain as the watermark.
       3. Resolves only entries whose key is no longer detected this run AND is
-         PROVEN recovered (matching rows exist in df_valid with count == n_rows).
-         Confirmed entries are removed from the manifest and written as fix
-         records to fix_error_list_watermark/date=YYYYMMDD/fix_<run_key>.json.
+         PROVEN recovered (matching rows exist in df_valid with count == n_rows),
+         OR carries a 'date_future' error reason (correcting a wrong date changes
+         its key, so count-match can never fire; absence this run is proof of
+         remediation), OR is a legacy pre-tagging entry whose stored error_date is
+         in the future (one-time cleanup). Resolved entries are removed from the
+         manifest and written as fix records to
+         fix_error_list_watermark/date=YYYYMMDD/fix_<run_key>.json.
       4. Refreshes open entries still detected this run with the latest
          n_rows / affected_columns / path, and appends new open entries not
          already present.
       5. Writes the manifest back only if something changed (avoids creating
          an empty file when there is nothing to do).
 
-    Returns the list of confirmed resolved entries (sheet_name, creds, error_date)
+    Returns the list of confirmed resolved entries (sheet_name, creds, toko, error_date)
     so callers can re-load the recovered rows via PATH A (bypassing the watermark).
     """
     if df_valid is None:
@@ -267,17 +353,39 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
 
         sn_col = "sheet_name" if "sheet_name" in df_error.columns else "creds"
         cr_col = "creds" if "creds" in df_error.columns else sn_col
+        if "Toko" in df_error.columns:
+            toko_col = "Toko"
+        elif "toko" in df_error.columns:
+            toko_col = "toko"
+        else:
+            toko_col = None
 
-        for (sheet_name, creds, error_date), idx in df_error.groupby([sn_col, cr_col, "_error_date"]).groups.items():
+        if toko_col is not None:
+            group_cols = [sn_col, cr_col, toko_col, "_error_date"]
+        else:
+            group_cols = [sn_col, cr_col, "_error_date"]
+
+        for keys, idx in df_error.groupby(group_cols, dropna=False).groups.items():
+            if toko_col is not None:
+                sheet_name, creds, toko, error_date = keys
+                toko = "" if pd.isna(toko) else str(toko)
+            else:
+                sheet_name, creds, error_date = keys
+                toko = ""
             current_entries.append({
                 "sheet_name": str(sheet_name),
                 "creds": str(creds),
+                "toko": str(toko),
                 "error_date": str(error_date),
                 "affected_columns": list(report["affected_columns"]),
+                "error_reasons": sorted({
+                    str(r) for r in df_error.loc[idx, "error_reason"]
+                }) if "error_reason" in df_error.columns else [],
                 "n_rows": int(len(idx)),
                 "reported_at": now,
                 "path": quarantine_path,
                 "status": "open",
+                "open_since": now,
             })
 
     manifest_existed = True
@@ -295,34 +403,53 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
         else:
             raise e
 
-    current_keys = {(e["sheet_name"], e["creds"], e["error_date"]) for e in current_entries}
+    current_keys = {(e["sheet_name"], e["creds"], e.get("toko") or "", e["error_date"]) for e in current_entries}
 
-    candidates = []
+    # Only resolve keys that are PROVEN recovered (same count of valid rows as the
+    # manifest n_rows). Absence from df_error is not proof: an error can change
+    # signature (e.g. numeric -> date) and would otherwise be falsely marked fixed,
+    # destroying the recovery hook for a later real fix.
+    confirmed = _confirmed_recovered_keys(df_valid, [
+        {
+            "sheet_name": str(rec.get("sheet_name")),
+            "creds": str(rec.get("creds")),
+            "toko": str(rec.get("toko") or ""),
+            "error_date": str(rec.get("error_date")),
+            "n_rows": rec.get("n_rows"),
+        }
+        for rec in open_records
+        if (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("toko") or ""), str(rec.get("error_date"))) not in current_keys
+    ])
+
+    resolved = []
     refreshed = {}
+    n_legacy_resolved = 0
     for rec in open_records:
-        key = (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("error_date")))
+        key = (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("toko") or ""), str(rec.get("error_date")))
         if key in current_keys:
             refreshed[key] = rec
-        else:
-            candidates.append(rec)
-
-    # Only resolve keys that are PROVEN recovered (same count of valid rows as
-    # the manifest n_rows). Absence from df_error is not proof: an error can
-    # change signature (e.g. numeric -> date) and would otherwise be falsely
-    # marked fixed, destroying the recovery hook for a later real fix.
-    confirmed = _confirmed_recovered_keys(df_valid, candidates)
-    resolved = []
-    for rec in candidates:
-        key = (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("error_date")))
-        if key in confirmed:
+        elif key in confirmed or _is_date_future_entry(rec):
             resolved.append(rec)
+        elif _is_legacy_future_date(rec):
+            resolved.append(rec)
+            n_legacy_resolved += 1
         else:
             refreshed[key] = rec  # unconfirmed -> keep open
 
     # Fresh current-run entries always win: refresh n_rows / affected_columns /
     # reported_at / path for keys that already exist, append brand-new keys.
+    # open_since is carried forward from the previous manifest so it records the
+    # FIRST time the key was reported, not this run's refresh.
+    open_since_map = {
+        (str(r.get("sheet_name")), str(r.get("creds")), str(r.get("toko") or ""), str(r.get("error_date"))):
+        r.get("open_since") or r.get("reported_at") or now
+        for r in open_records
+    }
     for entry in current_entries:
-        refreshed[(entry["sheet_name"], entry["creds"], entry["error_date"])] = entry
+        key = (entry["sheet_name"], entry["creds"], entry["toko"], entry["error_date"])
+        entry = dict(entry)
+        entry["open_since"] = open_since_map.get(key) or now
+        refreshed[key] = entry
 
     remaining = list(refreshed.values())
 
@@ -340,50 +467,122 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
         fixes = [{
             "sheet_name": r["sheet_name"],
             "creds": r["creds"],
+            "toko": r.get("toko") or "",
             "error_date": r["error_date"],
             "affected_columns": r.get("affected_columns", []),
             "resolved_at": now,
             "path": r.get("path", ""),
             "status": "fixed",
         } for r in resolved]
-        minio_client.put_object(bucket, fix_folder, io.BytesIO(b""), length=0)
-        payload = json.dumps({"fixes": fixes}, ensure_ascii=False).encode("utf-8")
+        if dry_run:
+            print(f"[DRY-RUN] Akan tulis fix record {len(fixes)} error entr(y/ies) -> {fix_path}")
+        else:
+            minio_client.put_object(bucket, fix_folder, io.BytesIO(b""), length=0)
+            payload = json.dumps({"fixes": fixes}, ensure_ascii=False).encode("utf-8")
+            minio_client.put_object(
+                bucket,
+                fix_path,
+                io.BytesIO(payload),
+                length=len(payload),
+                content_type="application/json",
+            )
+            print(f"[MINIO] Resolved {len(fixes)} error entr(y/ies) -> fix record: {fix_path}")
+
+    if n_legacy_resolved:
+        print(f"[MINIO] Cleaned {n_legacy_resolved} legacy future-date error entr(y/ies)")
+
+    if dry_run:
+        if current_entries:
+            print(f"[DRY-RUN] Akan sync {len(current_entries)} open error entr(y/ies) ke {manifest_path}")
+    else:
+        payload = json.dumps({"errors": remaining}, ensure_ascii=False).encode("utf-8")
         minio_client.put_object(
             bucket,
-            fix_path,
+            manifest_path,
             io.BytesIO(payload),
             length=len(payload),
             content_type="application/json",
         )
-        print(f"[MINIO] Resolved {len(fixes)} error entr(y/ies) -> fix record: {fix_path}")
-
-    payload = json.dumps({"errors": remaining}, ensure_ascii=False).encode("utf-8")
-    minio_client.put_object(
-        bucket,
-        manifest_path,
-        io.BytesIO(payload),
-        length=len(payload),
-        content_type="application/json",
-    )
-    if current_entries:
-        print(f"[MINIO] Synced {len(current_entries)} open error entr(y/ies) to {manifest_path}")
-
+        if current_entries:
+            print(f"[MINIO] Synced {len(current_entries)} open error entr(y/ies) to {manifest_path}")
     return resolved
 
 
-def filter_by_sheet_watermark(df: pd.DataFrame, sheet_col: str, date_col: str, watermarks: dict) -> tuple[pd.DataFrame, dict]:
-    """Per-sheet incremental filter on already-clean dates (Timestamp dtype).
+def get_open_error_entries(minio_client: Minio, bucket: str, manifest_path: str = ERROR_MANIFEST_PATH) -> list:
+    """Reads the OPEN entries currently held in the error manifest.
 
-    For each group key (e.g. creds/sheet_name), keep rows where date > watermarks[key].
-    Groups without a watermark are treated as full load.
+    Returns the raw manifest records with status == "open" (empty list when the
+    manifest is absent). Each is keyed by (sheet_name, creds, toko, error_date)
+    and now carries open_since (first-reported timestamp) so callers can tell a
+    freshly-quarantined group (pending recovery, expected drift while the error
+    is upstream) from a never-resolved one.
+    """
+    try:
+        minio_client.stat_object(bucket, manifest_path)
+        response = minio_client.get_object(bucket, manifest_path)
+        data = json.loads(response.read().decode("utf-8"))
+        response.close()
+        response.release_conn()
+        return [r for r in data.get("errors", []) if r.get("status") == "open"]
+    except S3Error as e:
+        if e.code in ["NoSuchKey", "AccessDenied"]:
+            return []
+        raise e
+
+
+def filter_by_sheet_watermark(df: pd.DataFrame, creds_col: str, sheet_name_col: str, toko_col: str, date_col: str, watermarks: dict) -> tuple[pd.DataFrame, dict]:
+    """Per-(creds,sheet_name,toko) incremental filter on already-clean dates (Timestamp dtype).
+
+    Grain is (creds, sheet_name, toko) — toko verbatim, no normalization.
+    For each group key (creds, sheet_name, toko), keep rows where date > watermarks[key].
+    Groups without a watermark are treated as full load. Preserves temp sheets
+    (riwa vs riwa_ajwa share creds but different sheet_name) — implemented only for Data Live now.
     Returns (filtered_df, sheet_max_dates) where sheet_max_dates maps
-    the group key -> last processed date (ISO) computed only from kept rows.
+    (creds, sheet_name, toko) -> last processed date (ISO).
     """
     parsed = pd.to_datetime(df[date_col])
 
+    # Guard: missing columns fallback (should not happen after validate)
+    if creds_col not in df.columns or sheet_name_col not in df.columns or toko_col not in df.columns:
+        # fallback to available cols
+        cols = [c for c in [creds_col, sheet_name_col, toko_col] if c in df.columns]
+        if not cols:
+            return df.copy(), {}
+        keep = pd.Series(True, index=df.index)
+        # try triple lookup, fallback to double
+        for keys, idx in df.groupby(cols, dropna=False).groups.items():
+            if not isinstance(keys, tuple):
+                keys = (keys,)
+            # pad to 3
+            creds_k = str(keys[0]) if len(keys) > 0 and pd.notna(keys[0]) else ""
+            sheet_k = str(keys[1]) if len(keys) > 1 and pd.notna(keys[1]) else ""
+            toko_k = str(keys[2]) if len(keys) > 2 and pd.notna(keys[2]) else (str(keys[1]) if len(keys)==2 else "")
+            wm = watermarks.get((creds_k, sheet_k, toko_k))
+            if wm is None and len(keys)==2:
+                wm = watermarks.get((creds_k, toko_k))
+            if wm:
+                cutoff = pd.Timestamp(wm)
+                keep.loc[idx] = parsed.loc[idx] > cutoff
+        filtered = df[keep].copy()
+        sheet_max_dates = {}
+        parsed_kept = parsed[keep]
+        for keys, idx in filtered.groupby(cols, dropna=False).groups.items():
+            mx = parsed_kept.loc[idx].dropna()
+            if not mx.empty:
+                if not isinstance(keys, tuple):
+                    keys = (keys,)
+                creds_k = str(keys[0]) if len(keys) > 0 and pd.notna(keys[0]) else ""
+                sheet_k = str(keys[1]) if len(keys) > 1 and pd.notna(keys[1]) else ""
+                toko_k = str(keys[2]) if len(keys) > 2 and pd.notna(keys[2]) else (str(keys[1]) if len(keys)==2 else "")
+                sheet_max_dates[(creds_k, sheet_k, toko_k)] = mx.max().date().isoformat()
+        return filtered, sheet_max_dates
+
     keep = pd.Series(True, index=df.index)
-    for name, idx in df.groupby(sheet_col).groups.items():
-        wm = watermarks.get(name)
+    for (creds_val, sheet_val, toko_val), idx in df.groupby([creds_col, sheet_name_col, toko_col], dropna=False).groups.items():
+        creds_key = "" if pd.isna(creds_val) else str(creds_val)
+        sheet_key = "" if pd.isna(sheet_val) else str(sheet_val)
+        toko_key = "" if pd.isna(toko_val) else str(toko_val)
+        wm = watermarks.get((creds_key, sheet_key, toko_key))
         if wm:
             cutoff = pd.Timestamp(wm)
             keep.loc[idx] = parsed.loc[idx] > cutoff
@@ -392,9 +591,12 @@ def filter_by_sheet_watermark(df: pd.DataFrame, sheet_col: str, date_col: str, w
 
     sheet_max_dates = {}
     parsed_kept = parsed[keep]
-    for name, idx in filtered.groupby(sheet_col).groups.items():
+    for (creds_val, sheet_val, toko_val), idx in filtered.groupby([creds_col, sheet_name_col, toko_col], dropna=False).groups.items():
         mx = parsed_kept.loc[idx].dropna()
         if not mx.empty:
-            sheet_max_dates[name] = mx.max().date().isoformat()
+            creds_key = "" if pd.isna(creds_val) else str(creds_val)
+            sheet_key = "" if pd.isna(sheet_val) else str(sheet_val)
+            toko_key = "" if pd.isna(toko_val) else str(toko_val)
+            sheet_max_dates[(creds_key, sheet_key, toko_key)] = mx.max().date().isoformat()
 
     return filtered, sheet_max_dates
