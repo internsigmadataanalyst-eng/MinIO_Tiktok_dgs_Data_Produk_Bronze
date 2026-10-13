@@ -10,6 +10,7 @@ from src.data_produk.utils.transform_utils import (
     PERCENT_COLS,
     to_snake_case,
 )
+from src.data_produk.utils.gsheet_client import with_retry_on_429
 from src.data_produk.utils.log import emit
 
 
@@ -20,6 +21,11 @@ SHEET_REGISTRY = {
     "riwa": "SH_KEY_RIWA",
     "imam": "SH_KEY_IMAM",
 }
+
+# Worksheet/tab title inside every registered spreadsheet. The registry keys
+# (matz, ian, ...) are logical labels, NOT tab names -- all five spreadsheets
+# expose their data on a tab called "Data Produk".
+WORKSHEET_NAME = "Data Produk"
 
 # Columns the transform and the silver SQL require. Checked against each
 # sheet's OWN header (values[2]) before the frame exists -- once sheets are
@@ -81,9 +87,9 @@ def fetch_tiktok_data_produk(gc: gspread.Client) -> pd.DataFrame:
     """
     frames = []
     for sheet_name, env_key in SHEET_REGISTRY.items():
-        sh = gc.open_by_key(os.getenv(env_key))
-        ws = sh.worksheet("Data Produk")
-        values = ws.get_all_values()
+        sh = with_retry_on_429(gc.open_by_key, os.getenv(env_key))
+        ws = with_retry_on_429(sh.worksheet, WORKSHEET_NAME)
+        values = with_retry_on_429(ws.get_all_values)
         _check_header(sheet_name, values[2])
         df_sheet = pd.DataFrame(values[3:], columns=values[2])
         df_sheet = df_sheet.loc[:, ~df_sheet.columns.duplicated()]

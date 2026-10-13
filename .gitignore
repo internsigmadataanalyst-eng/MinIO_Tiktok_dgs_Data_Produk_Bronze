@@ -12,6 +12,7 @@ scripts/
 PLANNING_STAGE.md
 tests/
 verify_quarantine_v2.py
+schema_ddl.sql
 
 # ETL logs
 logs/

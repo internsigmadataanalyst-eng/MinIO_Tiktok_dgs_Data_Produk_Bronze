@@ -35,7 +35,10 @@ from src.data_produk.pipelines.config import (
     WHITELIST_SHEETS,
     WATERMARK_PATH,
 )
-from src.data_produk.utils.gsheet_client import get_gspread_client
+from src.data_produk.utils.gsheet_client import (
+    get_gspread_client,
+    with_retry_on_429,
+)
 from src.data_produk.utils.minio_client import get_minio_client, get_sheet_watermarks
 from src.data_produk.utils.transform_utils import parse_mixed_dates, to_snake_case
 
@@ -75,41 +78,20 @@ def col_index_to_letter(index: int) -> str:
     return letters
 
 
-def with_retry(func, *args, max_retries: int = 4, **kwargs):
-    """Retry a gspread call with linear backoff on rate-limit errors."""
-    delay = 15
-    attempts = 0
-    while True:
-        try:
-            return func(*args, **kwargs)
-        except (gspread.exceptions.APIError, gspread.exceptions.RateLimitError) as e:
-            attempts += 1
-            if attempts > max_retries:
-                raise RuntimeError(
-                    f"[RETRY] {func.__name__} gagal setelah {max_retries + 1} "
-                    f"percobaan (rate limit): {e!r}"
-                )
-            headers = getattr(getattr(e, "response", None), "headers", {}) or {}
-            retry_after = headers.get("Retry-After")
-            if retry_after is not None:
-                try:
-                    delay = max(int(retry_after), delay)
-                except (TypeError, ValueError):
-                    pass
-            print(
-                f"[RETRY] {func.__name__} rate-limited (attempt {attempts}/{max_retries}), "
-                f"retry in {delay}s ..."
-            )
-            import time
-
-            time.sleep(delay)
+def with_retry(func, *args, max_retries: int = 4, base_delay: int = 15, **kwargs):
+    """Retry wrapper with linear backoff for Google Sheets API 429 rate limits."""
+    return with_retry_on_429(
+        func, *args, max_retries=max_retries, delay=base_delay, **kwargs
+    )
 
 
 def get_df_minimal(
     sh, sheet_name: str, min_cols=None, header_row=HEADER_ROW, data_start_row=DATA_START_ROW
 ) -> pd.DataFrame:
     """Read only the date/toko/ID columns of a Data Produk worksheet."""
-    ws = sh.worksheet(sheet_name)
+    from src.data_produk.ingestion.fetch_data_produk_gsheet import WORKSHEET_NAME
+
+    ws = sh.worksheet(WORKSHEET_NAME)
     header_raw = with_retry(ws.row_values, header_row + 1)
     header = [to_snake_case(h)[:128] or f"col_{i}" for i, h in enumerate(header_raw)]
     have = set(header)
@@ -157,7 +139,7 @@ def get_max_tanggal_by_toko(df: pd.DataFrame) -> dict:
 
 def get_watermark_map(minio_client, bucket: str) -> dict:
     """{(creds, sheet_name, toko): last_processed_date}."""
-    records = get_sheet_watermarks(minio_client, bucket, path=WATERMARK_PATH)
+    _, records = get_sheet_watermarks(minio_client, bucket, WATERMARK_PATH)
     wm = {}
     for rec in records or []:
         creds = str(rec.get("creds") or "")
@@ -233,7 +215,7 @@ def data_produk_watermark_check(
       summary                : {n_tokos, n_stale, n_whitelisted_drift}
     """
     if whitelist_sheets is None:
-        whitelist_sheets = [s.strip() for s in WHITELIST_SHEETS.split(",") if s.strip()]
+        whitelist_sheets = list(WHITELIST_SHEETS)
 
     from src.data_produk.ingestion.fetch_data_produk_gsheet import SHEET_REGISTRY
 
